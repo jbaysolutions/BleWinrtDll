@@ -442,9 +442,6 @@ void StopDeviceScan() {
 	deviceQueueSignal.notify_one();
 }
 
-
-
-
 ScanStatus PollDevice(DeviceUpdate* device, bool block) {
 	ScanStatus res;
 	unique_lock<mutex> lock(deviceQueueLock);
