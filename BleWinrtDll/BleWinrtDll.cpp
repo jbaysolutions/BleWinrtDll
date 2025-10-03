@@ -23,6 +23,8 @@ using namespace Windows::Devices::Enumeration;
 
 using namespace Windows::Storage::Streams;
 
+using namespace Windows::Devices::Radios;
+
 union to_guid
 {
 	uint8_t buf[16];
@@ -255,6 +257,22 @@ void DeviceWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate deviceI
 }
 void DeviceWatcher_EnumerationCompleted(DeviceWatcher sender, IInspectable const&) {
 	StopDeviceScan();
+}
+
+bool IsBluetoothAvailable()
+{
+	try {
+		init_apartment(apartment_type::multi_threaded);
+		auto radios = Radio::GetRadiosAsync().get();
+		for (auto const& r : radios) {
+			if (r.Kind() == RadioKind::Bluetooth)
+				return r.State() == RadioState::On;
+		}
+		return false; // no BT radio found
+	}
+	catch (...) {
+		return false;
+	}
 }
 
 void StartDeviceScan() {

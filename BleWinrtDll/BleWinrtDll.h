@@ -35,6 +35,8 @@ enum class ScanStatus { PROCESSING, AVAILABLE, FINISHED };
 
 extern "C" {
 
+	__declspec(dllexport) bool IsBluetoothAvailable();
+
 	__declspec(dllexport) void StartDeviceScan();
 
 	__declspec(dllexport) ScanStatus PollDevice(DeviceUpdate* device, bool block);
