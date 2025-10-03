@@ -60,4 +60,12 @@ extern "C" {
 	__declspec(dllexport) void Quit();
 
 	__declspec(dllexport) void GetError(ErrorMessage* buf);
+	
+	// C ABI log sink (optional). Register a callback from Unity; pass nullptr to clear.
+	typedef void(__cdecl* BleLogSinkFn)(const wchar_t* msg);
+
+	__declspec(dllexport) void SetLogSink(BleLogSinkFn sink);
+
+	// Your availability probe that also logs the radios found.
+	__declspec(dllexport) bool IsBluetoothAvailable();
 }

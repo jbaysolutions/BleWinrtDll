@@ -35,3 +35,6 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Radios.h>
+
+#include <string>
+#include <iostream>

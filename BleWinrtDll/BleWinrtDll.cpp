@@ -259,20 +259,105 @@ void DeviceWatcher_EnumerationCompleted(DeviceWatcher sender, IInspectable const
 	StopDeviceScan();
 }
 
+static const wchar_t* KindToStr(RadioKind k)
+{
+	switch (k)
+	{
+	case RadioKind::Other:     return L"Other";
+	case RadioKind::WiFi:      return L"WiFi";
+	case RadioKind::MobileBroadband: return L"MobileBroadband";
+	case RadioKind::Bluetooth: return L"Bluetooth";
+	case RadioKind::FM:        return L"FM";
+	default:                   return L"UnknownKind";
+	}
+}
+
+static const wchar_t* StateToStr(RadioState s)
+{
+	switch (s)
+	{
+	case RadioState::Unknown:  return L"Unknown";
+	case RadioState::On:       return L"On";
+	case RadioState::Off:      return L"Off";
+	case RadioState::Disabled: return L"Disabled";
+	default:                   return L"UnknownState";
+	}
+}
+
+// ---- logging sink (no windows.h) ----
+static BleLogSinkFn g_logSink = nullptr;
+
+extern "C" __declspec(dllexport) void SetLogSink(BleLogSinkFn sink)
+{
+    g_logSink = sink;
+}
+
+static inline void LogLine(const std::wstring& s)
+{
+    if (g_logSink) g_logSink(s.c_str());
+    else           std::wcerr << s << L'\n'; // simple fallback
+}
+
+static inline void ensure_apartment()
+{
+    try
+    {
+        // OK on threads without a COM apartment; throws if already STA
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    }
+    catch (winrt::hresult_error const& e)
+    {
+        // Ignore "Cannot change thread mode after it is set." (RPC_E_CHANGED_MODE)
+        if (e.code() != winrt::hresult{ static_cast<int32_t>(0x80010106) })
+        {
+            throw; // anything else is a real error
+        }
+        // Already initialized (likely STA) — safe to proceed.
+    }
+}
+
+// ---- availability with full radio dump (no windows.h) ----
 bool IsBluetoothAvailable()
 {
-	try {
-		init_apartment(apartment_type::multi_threaded);
-		auto radios = Radio::GetRadiosAsync().get();
-		for (auto const& r : radios) {
-			if (r.Kind() == RadioKind::Bluetooth)
-				return r.State() == RadioState::On;
-		}
-		return false; // no BT radio found
-	}
-	catch (...) {
-		return false;
-	}
+    try
+    {
+        ensure_apartment();
+
+        auto radios = Radio::GetRadiosAsync().get();
+        LogLine(L"[BleWinrtDll] ---- Radio enumeration ----");
+        LogLine(L"[BleWinrtDll] Count = " + std::to_wstring(radios.Size()));
+
+        bool anyBt = false, btOn = false;
+
+        for (auto const& r : radios)
+        {
+            std::wstring name = r.Name().c_str();
+            std::wstring line = L"[BleWinrtDll]  - Name=\"" + name +
+                                L"\", Kind=" + KindToStr(r.Kind()) +
+                                L", State=" + StateToStr(r.State());
+            LogLine(line);
+
+            if (r.Kind() == RadioKind::Bluetooth) {
+                anyBt = true;
+                if (r.State() == RadioState::On) btOn = true;
+            }
+        }
+
+        if (!anyBt) LogLine(L"[BleWinrtDll] No Bluetooth radio found.");
+        LogLine(L"[BleWinrtDll] ---- End enumeration ----");
+
+        return btOn;
+    }
+    catch (hresult_error const& e)
+    {
+        LogLine(std::wstring(L"[BleWinrtDll] Radio enumeration failed: ") + e.message().c_str());
+        return false;
+    }
+    catch (...)
+    {
+        LogLine(L"[BleWinrtDll] Radio enumeration failed: unknown exception.");
+        return false;
+    }
 }
 
 void StartDeviceScan() {
