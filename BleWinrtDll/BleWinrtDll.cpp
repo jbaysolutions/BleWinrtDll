@@ -15,7 +15,6 @@ using namespace std;
 using namespace winrt;
 using namespace Windows::Foundation;
 using namespace Windows::Foundation::Collections;
-using namespace Windows::Web::Syndication;
 
 using namespace Windows::Devices::Bluetooth;
 using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
