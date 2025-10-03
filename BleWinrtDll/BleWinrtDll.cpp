@@ -255,32 +255,7 @@ void DeviceWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate deviceI
 	}
 }
 void DeviceWatcher_EnumerationCompleted(DeviceWatcher sender, IInspectable const&) {
-	StopDeviceScan();
-}
-
-static const wchar_t* KindToStr(RadioKind k)
-{
-	switch (k)
-	{
-	case RadioKind::Other:     return L"Other";
-	case RadioKind::WiFi:      return L"WiFi";
-	case RadioKind::MobileBroadband: return L"MobileBroadband";
-	case RadioKind::Bluetooth: return L"Bluetooth";
-	case RadioKind::FM:        return L"FM";
-	default:                   return L"UnknownKind";
-	}
-}
-
-static const wchar_t* StateToStr(RadioState s)
-{
-	switch (s)
-	{
-	case RadioState::Unknown:  return L"Unknown";
-	case RadioState::On:       return L"On";
-	case RadioState::Off:      return L"Off";
-	case RadioState::Disabled: return L"Disabled";
-	default:                   return L"UnknownState";
-	}
+	// StopDeviceScan();
 }
 
 // ---- logging sink (no windows.h) ----
@@ -315,6 +290,70 @@ static inline void ensure_apartment()
     }
 }
 
+uint32_t GetRadios(RadioInfo* radios, uint32_t capacity)
+{
+    const uint32_t bufferCapacity = (radios != nullptr) ? capacity : 0;
+    uint32_t bluetoothCount = 0;
+
+    try
+    {
+        ensure_apartment();
+
+        auto accessStatus = Radio::RequestAccessAsync().get();
+        if (accessStatus != RadioAccessStatus::Allowed)
+        {
+            saveError(L"%s:%d Bluetooth radio access denied (status %d).",
+                      __WFILE__, __LINE__, static_cast<int32_t>(accessStatus));
+            return 0;
+        }
+
+        auto radiosVector = Radio::GetRadiosAsync().get();
+        LogLine(L"[BleWinrtDll] ---- Bluetooth radio enumeration ----");
+
+        for (auto const& radio : radiosVector)
+        {
+            if (radio.Kind() != RadioKind::Bluetooth)
+            {
+                continue;
+            }
+
+            if (bufferCapacity && bluetoothCount < bufferCapacity)
+            {
+                auto& out = radios[bluetoothCount];
+                wcsncpy_s(out.name,
+                          _countof(out.name),
+                          radio.Name().c_str(),
+                          _TRUNCATE);
+                out.kind = static_cast<int32_t>(radio.Kind());
+                out.state = static_cast<int32_t>(radio.State());
+                out.accessStatus = static_cast<int32_t>(accessStatus);
+            }
+
+            ++bluetoothCount;
+        }
+
+        if (bufferCapacity && bluetoothCount > bufferCapacity)
+        {
+            LogLine(L"[BleWinrtDll] Warning: radio buffer truncated.");
+        }
+
+        clearError();
+        return bluetoothCount;
+    }
+    catch (hresult_error const& e)
+    {
+        saveError(L"%s:%d Bluetooth radio enumeration failed: %s",
+                  __WFILE__, __LINE__, e.message().c_str());
+    }
+    catch (...)
+    {
+        saveError(L"%s:%d Bluetooth radio enumeration failed: unknown exception.",
+                  __WFILE__, __LINE__);
+    }
+
+    return 0;
+}
+
 // ---- availability with full radio dump (no windows.h) ----
 bool IsBluetoothAvailable()
 {
@@ -332,8 +371,8 @@ bool IsBluetoothAvailable()
         {
             std::wstring name = r.Name().c_str();
             std::wstring line = L"[BleWinrtDll]  - Name=\"" + name +
-                                L"\", Kind=" + KindToStr(r.Kind()) +
-                                L", State=" + StateToStr(r.State());
+                                L"\", Kind=" + std::to_wstring(static_cast<int32_t>(r.Kind())) +
+                                L", State=" + std::to_wstring(static_cast<int32_t>(r.State()));
             LogLine(line);
 
             if (r.Kind() == RadioKind::Bluetooth) {
@@ -359,7 +398,7 @@ bool IsBluetoothAvailable()
     }
 }
 
-void StartDeviceScan() {
+void StartDeviceScan(uint32_t seconds) {
 	// as this is the first function that must be called, if Quit() was called before, assume here that the client wants to restart
 	{
 		lock_guard lock(quitLock);
@@ -381,7 +420,30 @@ void StartDeviceScan() {
 	// ~30 seconds scan ; for permanent scanning use BluetoothLEAdvertisementWatcher, see the BluetoothAdvertisement.zip sample
 	deviceScanFinished = false;
 	deviceWatcher.Start();
+
+	if (seconds > 0) {
+        std::thread([seconds] {
+            std::this_thread::sleep_for(std::chrono::seconds(seconds));
+            StopDeviceScan();
+        }).detach();
+    }
 }
+
+void StopDeviceScan() {
+	lock_guard lock(deviceQueueLock);
+	if (deviceWatcher != nullptr) {
+		deviceWatcherAddedRevoker.revoke();
+		deviceWatcherUpdatedRevoker.revoke();
+		deviceWatcherCompletedRevoker.revoke();
+		deviceWatcher.Stop();
+		deviceWatcher = nullptr;
+	}
+	deviceScanFinished = true;
+	deviceQueueSignal.notify_one();
+}
+
+
+
 
 ScanStatus PollDevice(DeviceUpdate* device, bool block) {
 	ScanStatus res;
@@ -399,19 +461,6 @@ ScanStatus PollDevice(DeviceUpdate* device, bool block) {
 	else
 		res = ScanStatus::PROCESSING;
 	return res;
-}
-
-void StopDeviceScan() {
-	lock_guard lock(deviceQueueLock);
-	if (deviceWatcher != nullptr) {
-		deviceWatcherAddedRevoker.revoke();
-		deviceWatcherUpdatedRevoker.revoke();
-		deviceWatcherCompletedRevoker.revoke();
-		deviceWatcher.Stop();
-		deviceWatcher = nullptr;
-	}
-	deviceScanFinished = true;
-	deviceQueueSignal.notify_one();
 }
 
 fire_and_forget ScanServicesAsync(wchar_t* deviceId) {

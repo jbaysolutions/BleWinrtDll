@@ -4,6 +4,13 @@
 
 typedef void(__cdecl* BleLogSinkFn)(const wchar_t* msg);
 
+struct RadioInfo {
+    wchar_t name[256];
+    int32_t kind;   // Windows::Devices::Radios::RadioKind
+    int32_t state;  // Windows::Devices::Radios::RadioState
+    int32_t accessStatus; // Windows::Devices::Radios::RadioAccessStatus
+};
+
 struct DeviceUpdate {
     wchar_t id[100];
     bool isConnectable = false;
