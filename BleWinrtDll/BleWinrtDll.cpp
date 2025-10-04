@@ -205,6 +205,56 @@ queue<BLEData> dataQueue{};
 mutex dataQueueLock;
 condition_variable dataQueueSignal;
 
+namespace
+{
+    DeviceUpdate MakeDeviceUpdate(DeviceInformation const& info)
+    {
+        DeviceUpdate update{};
+        wcscpy_s(update.id, _countof(update.id), info.Id().c_str());
+
+        if (info.Name().size())
+        {
+            wcscpy_s(update.name, _countof(update.name), info.Name().c_str());
+            update.nameUpdated = true;
+        }
+
+        if (info.Properties().HasKey(L"System.Devices.Aep.Bluetooth.Le.IsConnectable"))
+        {
+            update.isConnectable =
+                unbox_value<bool>(info.Properties().Lookup(L"System.Devices.Aep.Bluetooth.Le.IsConnectable"));
+            update.isConnectableUpdated = true;
+        }
+        return update;
+    }
+
+    DeviceUpdate MakeDeviceUpdate(DeviceInformationUpdate const& info)
+    {
+        DeviceUpdate update{};
+        wcscpy_s(update.id, _countof(update.id), info.Id().c_str());
+
+        if (info.Properties().HasKey(L"System.Devices.Aep.Bluetooth.Le.IsConnectable"))
+        {
+            update.isConnectable =
+                unbox_value<bool>(info.Properties().Lookup(L"System.Devices.Aep.Bluetooth.Le.IsConnectable"));
+            update.isConnectableUpdated = true;
+        }
+        return update;
+    }
+
+	inline bool ShouldQuit()
+    {
+        std::lock_guard guard(quitLock);
+        return quitFlag;
+    }
+
+    inline void Enqueue(DeviceUpdate const& update)
+    {
+        std::lock_guard guard(deviceQueueLock);
+        deviceQueue.push(update);
+        deviceQueueSignal.notify_one();
+    }
+}
+
 bool QuittableWait(condition_variable& signal, unique_lock<mutex>& waitLock) {
 	{
 		lock_guard quit_lock(quitLock);
@@ -216,44 +266,18 @@ bool QuittableWait(condition_variable& signal, unique_lock<mutex>& waitLock) {
 	return quitFlag;
 }
 
-void DeviceWatcher_Added(DeviceWatcher sender, DeviceInformation deviceInfo) {
-	DeviceUpdate deviceUpdate;
-	wcscpy_s(deviceUpdate.id, sizeof(deviceUpdate.id) / sizeof(wchar_t), deviceInfo.Id().c_str());
-	wcscpy_s(deviceUpdate.name, sizeof(deviceUpdate.name) / sizeof(wchar_t), deviceInfo.Name().c_str());
-	deviceUpdate.nameUpdated = true;
-	if (deviceInfo.Properties().HasKey(L"System.Devices.Aep.Bluetooth.Le.IsConnectable")) {
-		deviceUpdate.isConnectable = unbox_value<bool>(deviceInfo.Properties().Lookup(L"System.Devices.Aep.Bluetooth.Le.IsConnectable"));
-		deviceUpdate.isConnectableUpdated = true;
-	}
-	{
-		lock_guard lock(quitLock);
-		if (quitFlag)
-			return;
-	}
-	{
-		lock_guard queueGuard(deviceQueueLock);
-		deviceQueue.push(deviceUpdate);
-		deviceQueueSignal.notify_one();
-	}
+void DeviceWatcher_Added(DeviceWatcher, DeviceInformation info)
+{
+    if (ShouldQuit()) return;
+    Enqueue(MakeDeviceUpdate(info));
 }
-void DeviceWatcher_Updated(DeviceWatcher sender, DeviceInformationUpdate deviceInfoUpdate) {
-	DeviceUpdate deviceUpdate;
-	wcscpy_s(deviceUpdate.id, sizeof(deviceUpdate.id) / sizeof(wchar_t), deviceInfoUpdate.Id().c_str());
-	if (deviceInfoUpdate.Properties().HasKey(L"System.Devices.Aep.Bluetooth.Le.IsConnectable")) {
-		deviceUpdate.isConnectable = unbox_value<bool>(deviceInfoUpdate.Properties().Lookup(L"System.Devices.Aep.Bluetooth.Le.IsConnectable"));
-		deviceUpdate.isConnectableUpdated = true;
-	}
-	{
-		lock_guard lock(quitLock);
-		if (quitFlag)
-			return;
-	}
-	{
-		lock_guard queueGuard(deviceQueueLock);
-		deviceQueue.push(deviceUpdate);
-		deviceQueueSignal.notify_one();
-	}
+
+void DeviceWatcher_Updated(DeviceWatcher, DeviceInformationUpdate info)
+{
+    if (ShouldQuit()) return;
+    Enqueue(MakeDeviceUpdate(info));
 }
+
 void DeviceWatcher_EnumerationCompleted(DeviceWatcher sender, IInspectable const&) {
 	// StopDeviceScan();
 }
@@ -442,22 +466,25 @@ void StopDeviceScan() {
 	deviceQueueSignal.notify_one();
 }
 
-ScanStatus PollDevice(DeviceUpdate* device, bool block) {
-	ScanStatus res;
-	unique_lock<mutex> lock(deviceQueueLock);
-	if (block && deviceQueue.empty() && !deviceScanFinished)
-		if (QuittableWait(deviceQueueSignal, lock))
-			return ScanStatus::FINISHED;
-	if (!deviceQueue.empty()) {
-		*device = deviceQueue.front();
-		deviceQueue.pop();
-		res = ScanStatus::AVAILABLE;
-	}
-	else if (deviceScanFinished)
-		res = ScanStatus::FINISHED;
-	else
-		res = ScanStatus::PROCESSING;
-	return res;
+ScanStatus PollDevice(DeviceUpdate* device, bool block)
+{
+    std::unique_lock<std::mutex> lock(deviceQueueLock);
+
+    while (deviceQueue.empty())
+    {
+        if (deviceScanFinished)
+            return ScanStatus::FINISHED;
+
+        if (!block)
+            return ScanStatus::PROCESSING;
+
+        if (QuittableWait(deviceQueueSignal, lock))
+            return ScanStatus::FINISHED;
+    }
+
+    *device = deviceQueue.front();
+    deviceQueue.pop();
+    return ScanStatus::AVAILABLE;
 }
 
 fire_and_forget ScanServicesAsync(wchar_t* deviceId) {
