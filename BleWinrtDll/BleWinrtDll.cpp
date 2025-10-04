@@ -253,6 +253,52 @@ namespace
         deviceQueue.push(update);
         deviceQueueSignal.notify_one();
     }
+
+	Service MakeService(GattDeviceService const& svc)
+    {
+        Service s{};
+        wcscpy_s(s.uuid, _countof(s.uuid), to_hstring(svc.Uuid()).c_str());
+        return s;
+    }
+
+    Characteristic MakeCharacteristic(GattCharacteristic const& c,
+                                      wchar_t const* userDescription)
+    {
+        Characteristic ch{};
+        wcscpy_s(ch.uuid, _countof(ch.uuid), to_hstring(c.Uuid()).c_str());
+        wcscpy_s(ch.userDescription, _countof(ch.userDescription), userDescription);
+        return ch;
+    }
+
+	void EnqueueService(Service const& svc)
+    {
+        std::lock_guard guard(serviceQueueLock);
+        serviceQueue.push(svc);
+        serviceQueueSignal.notify_one();
+    }
+
+    void EnqueueCharacteristic(Characteristic const& ch)
+    {
+        std::lock_guard guard(characteristicQueueLock);
+        characteristicQueue.push(ch);
+        characteristicQueueSignal.notify_one();
+    }
+
+    std::wstring ReadCharacteristicDescription(GattCharacteristic const& ch)
+    {
+        constexpr auto userDescUuid = L"00002901-0000-1000-8000-00805F9B34FB";
+        auto descScan = ch.GetDescriptorsForUuidAsync(make_guid(userDescUuid), BluetoothCacheMode::Uncached).get();
+        if (descScan.Descriptors().Size() == 0)
+            return L"no description available";
+
+        auto descriptor = descScan.Descriptors().GetAt(0);
+        auto value = descriptor.ReadValueAsync().get();
+        if (value.Status() != GattCommunicationStatus::Success)
+            throw hresult_error(E_FAIL, L"ReadValueAsync failed");
+
+        auto reader = DataReader::FromBuffer(value.Value());
+        return std::wstring(reader.ReadString(reader.UnconsumedBufferLength()));
+    }
 }
 
 bool QuittableWait(condition_variable& signal, unique_lock<mutex>& waitLock) {
@@ -606,21 +652,10 @@ fire_and_forget ScanServicesAsync(wchar_t* deviceId) {
 		if (bluetoothLeDevice != nullptr) {
 			GattDeviceServicesResult result = co_await bluetoothLeDevice.GetGattServicesAsync(BluetoothCacheMode::Uncached);
 			if (result.Status() == GattCommunicationStatus::Success) {
-				IVectorView<GattDeviceService> services = result.Services();
-				for (auto&& service : services)
+				for (auto&& svc : result.Services())
 				{
-					Service serviceStruct;
-					wcscpy_s(serviceStruct.uuid, sizeof(serviceStruct.uuid) / sizeof(wchar_t), to_hstring(service.Uuid()).c_str());
-					{
-						lock_guard lock(quitLock);
-						if (quitFlag)
-							break;
-					}
-					{
-						lock_guard queueGuard(serviceQueueLock);
-						serviceQueue.push(serviceStruct);
-						serviceQueueSignal.notify_one();
-					}
+					if (ShouldQuit()) break;
+					EnqueueService(MakeService(svc));
 				}
 			}
 			else {
@@ -672,38 +707,11 @@ fire_and_forget ScanCharacteristicsAsync(wchar_t* deviceId, wchar_t* serviceId) 
 			if (charScan.Status() != GattCommunicationStatus::Success)
 				saveError(L"%s:%d Error scanning characteristics from service %s width status %d", __WFILE__, __LINE__, serviceId, (int)charScan.Status());
 			else {
-				for (auto c : charScan.Characteristics())
+				for (auto&& c : charScan.Characteristics())
 				{
-					Characteristic charStruct;
-					wcscpy_s(charStruct.uuid, sizeof(charStruct.uuid) / sizeof(wchar_t), to_hstring(c.Uuid()).c_str());
-					// retrieve user description
-					GattDescriptorsResult descriptorScan = co_await c.GetDescriptorsForUuidAsync(make_guid(L"00002901-0000-1000-8000-00805F9B34FB"), BluetoothCacheMode::Uncached);
-					if (descriptorScan.Descriptors().Size() == 0) {
-						const wchar_t* defaultDescription = L"no description available";
-						wcscpy_s(charStruct.userDescription, sizeof(charStruct.userDescription) / sizeof(wchar_t), defaultDescription);
-					}
-					else {
-						GattDescriptor descriptor = descriptorScan.Descriptors().GetAt(0);
-						auto nameResult = co_await descriptor.ReadValueAsync();
-						if (nameResult.Status() != GattCommunicationStatus::Success)
-							saveError(L"%s:%d couldn't read user description for charasteristic %s, status %d", __WFILE__, __LINE__, to_hstring(c.Uuid()).c_str(), nameResult.Status());
-						else {
-							auto dataReader = DataReader::FromBuffer(nameResult.Value());
-							auto output = dataReader.ReadString(dataReader.UnconsumedBufferLength());
-							wcscpy_s(charStruct.userDescription, sizeof(charStruct.userDescription) / sizeof(wchar_t), output.c_str());
-							clearError();
-						}
-					}
-					{
-						lock_guard lock(quitLock);
-						if (quitFlag)
-							break;
-					}
-					{
-						lock_guard queueGuard(characteristicQueueLock);
-						characteristicQueue.push(charStruct);
-						characteristicQueueSignal.notify_one();
-					}
+					auto description = ReadCharacteristicDescription(c); // helper that wraps descriptor logic
+					if (ShouldQuit()) break;
+					EnqueueCharacteristic(MakeCharacteristic(c, description.c_str()));
 				}
 			}
 		}
@@ -740,6 +748,11 @@ ScanStatus PollCharacteristic(Characteristic* characteristic, bool block) {
 		res = ScanStatus::PROCESSING;
 	return res;
 }
+
+
+
+
+
 
 void Characteristic_ValueChanged(GattCharacteristic const& characteristic, GattValueChangedEventArgs args)
 {
