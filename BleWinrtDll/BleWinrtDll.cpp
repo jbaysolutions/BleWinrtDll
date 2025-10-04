@@ -285,7 +285,7 @@ void DeviceWatcher_EnumerationCompleted(DeviceWatcher sender, IInspectable const
 // ---- logging sink (no windows.h) ----
 static BleLogSinkFn g_logSink = nullptr;
 
-extern "C" __declspec(dllexport) void SetLogSink(BleLogSinkFn sink)
+void SetLogSink(BleLogSinkFn sink)
 {
     g_logSink = sink;
 }
@@ -486,6 +486,115 @@ ScanStatus PollDevice(DeviceUpdate* device, bool block)
     deviceQueue.pop();
     return ScanStatus::AVAILABLE;
 }
+
+// Connect
+IAsyncOperation<bool> ConnectDeviceAsync(wchar_t* deviceId)
+{
+    try
+    {
+        auto device = co_await retrieveDevice(deviceId);
+        if (!device)
+        {
+            saveError(L"%s:%d ConnectDeviceAsync: device not cached/available.", __WFILE__, __LINE__);
+            co_return false;
+        }
+
+        // Optional validation – touching GATT forces creation and surfaces access failures early.
+        auto probe = co_await device.GetGattServicesAsync(BluetoothCacheMode::Cached);
+        if (probe.Status() != GattCommunicationStatus::Success)
+        {
+            saveError(L"%s:%d ConnectDeviceAsync: probe failed with status %d.",
+                      __WFILE__, __LINE__, static_cast<int>(probe.Status()));
+            co_return false;
+        }
+
+        clearError();
+        co_return true;
+    }
+    catch (hresult_error const& e)
+    {
+        saveError(L"%s:%d ConnectDeviceAsync threw: %s",
+                  __WFILE__, __LINE__, e.message().c_str());
+        co_return false;
+    }
+    catch (...)
+    {
+        saveError(L"%s:%d ConnectDeviceAsync: unknown exception.",
+                  __WFILE__, __LINE__);
+        co_return false;
+    }
+}
+
+bool ConnectDevice(wchar_t* deviceId, bool block)
+{
+    auto op = ConnectDeviceAsync(deviceId);
+    return block ? op.get() : (op.Completed([](auto&&, auto&&) {}), true);
+}
+
+// Disconnect
+bool DisconnectDevice(wchar_t* deviceId)
+{
+    try
+    {
+        auto key = hsh(deviceId);
+        auto it = cache.find(key);
+        if (it == cache.end())
+        {
+            saveError(L"%s:%d DisconnectDevice: device %s not cached.",
+                      __WFILE__, __LINE__, deviceId);
+            return false;
+        }
+
+        // Remove subscriptions referencing this device
+        {
+            std::lock_guard subLock(subscribeQueueLock);
+            for (auto iter = subscriptions.begin(); iter != subscriptions.end();)
+            {
+                auto* sub = *iter;
+                if (sub && sub->characteristic.Service().Device().DeviceId() == deviceId)
+                {
+                    sub->revoker.revoke();
+                    delete sub;
+                    iter = subscriptions.erase(iter);
+                }
+                else
+                {
+                    ++iter;
+                }
+            }
+        }
+
+        // Close services and device
+        for (auto& svcPair : it->second.services)
+        {
+            svcPair.second.service.Close();
+        }
+        it->second.device.Close();
+        cache.erase(it);
+
+        clearError();
+        return true;
+    }
+    catch (hresult_error const& e)
+    {
+        saveError(L"%s:%d DisconnectDevice failed: %s",
+                  __WFILE__, __LINE__, e.message().c_str());
+    }
+    catch (...)
+    {
+        saveError(L"%s:%d DisconnectDevice failed: unknown exception.",
+                  __WFILE__, __LINE__);
+    }
+    return false;
+}
+
+
+
+
+
+
+
+
 
 fire_and_forget ScanServicesAsync(wchar_t* deviceId) {
 	{

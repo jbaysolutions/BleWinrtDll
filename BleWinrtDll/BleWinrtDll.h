@@ -17,6 +17,12 @@ extern "C" {
 
 	__declspec(dllexport) ScanStatus PollDevice(DeviceUpdate* device, bool block);
 
+    // Connect/disconnect against a WinRT device ID.
+    __declspec(dllexport) bool ConnectDevice(wchar_t* deviceId, bool block);
+	
+    __declspec(dllexport) bool DisconnectDevice(wchar_t* deviceId);
+
+
 	__declspec(dllexport) void ScanServices(wchar_t* deviceId);
 
 	__declspec(dllexport) ScanStatus PollService(Service* service, bool block);
