@@ -20,6 +20,8 @@ extern "C" {
     // Connect/disconnect against a WinRT device ID.
     __declspec(dllexport) bool ConnectDevice(wchar_t* deviceId, bool block);
 
+    __declspec(dllexport) bool PollConnection(ConnectionUpdate* update, bool block);
+
     __declspec(dllexport) bool DisconnectDevice(wchar_t* deviceId);
 
 
@@ -35,8 +37,12 @@ extern "C" {
 
 
 
-	
+
 	__declspec(dllexport) bool SubscribeCharacteristic(wchar_t* deviceId, wchar_t* serviceId, wchar_t* characteristicId, bool block);
+
+    __declspec(dllexport) bool UnsubscribeCharacteristic(wchar_t* deviceId,
+                                                         wchar_t* serviceId,
+                                                         wchar_t* characteristicId);
 
 	__declspec(dllexport) bool PollData(BLEData* data, bool block);
 

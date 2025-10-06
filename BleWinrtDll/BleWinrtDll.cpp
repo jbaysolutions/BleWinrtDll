@@ -79,10 +79,13 @@ struct ServiceCacheEntry {
 	map<long, CharacteristicCacheEntry> characteristics = { };
 };
 struct DeviceCacheEntry {
-	BluetoothLEDevice device = nullptr;
-	map<long, ServiceCacheEntry> services = { };
+    BluetoothLEDevice device = nullptr;
+    map<long, ServiceCacheEntry> services = { };
+    BluetoothLEDevice::ConnectionStatusChanged_revoker statusChangedRevoker{};
+    bool statusSubscribed = false;
 };
 map<long, DeviceCacheEntry> cache;
+void EnsureStatusSubscription(long key, BluetoothLEDevice const& device);
 
 
 // using hashes of uuids to omit storing the c-strings in reliable storage
@@ -109,20 +112,28 @@ void saveError(const wchar_t* message, ...) {
 	wcout << last_error << endl;
 }
 
-IAsyncOperation<BluetoothLEDevice> retrieveDevice(wchar_t* deviceId) {
-	if (cache.count(hsh(deviceId)))
-		co_return cache[hsh(deviceId)].device;
-	// !!!! BluetoothLEDevice.FromIdAsync may prompt for consent, in this case bluetooth will fail in unity!
-	BluetoothLEDevice result = co_await BluetoothLEDevice::FromIdAsync(deviceId);
-	if (result == nullptr) {
-		saveError(L"%s:%d Failed to connect to device.", __WFILE__, __LINE__);
-		co_return nullptr;
-	}
-	else {
-		clearError();
-		cache[hsh(deviceId)] = { result };
-		co_return cache[hsh(deviceId)].device;
-	}
+IAsyncOperation<BluetoothLEDevice> retrieveDevice(wchar_t* deviceId)
+{
+    auto key = hsh(deviceId);
+
+    if (auto it = cache.find(key); it != cache.end())
+    {
+        EnsureStatusSubscription(key, it->second.device);
+        co_return it->second.device;
+    }
+
+    BluetoothLEDevice result = co_await BluetoothLEDevice::FromIdAsync(deviceId);
+    if (!result)
+    {
+        saveError(L"%s:%d Failed to connect to device.", __WFILE__, __LINE__);
+        co_return nullptr;
+    }
+
+    clearError();
+    auto& entry = cache[key];
+    entry.device = result;
+    EnsureStatusSubscription(key, entry.device);
+    co_return entry.device;
 }
 IAsyncOperation<GattDeviceService> retrieveService(wchar_t* deviceId, wchar_t* serviceId) {
 	auto device = co_await retrieveDevice(deviceId);
@@ -534,6 +545,61 @@ ScanStatus PollDevice(DeviceUpdate* device, bool block)
 }
 
 // Connect
+queue<ConnectionUpdate> connectionQueue{};
+mutex connectionQueueLock;
+condition_variable connectionQueueSignal;
+
+
+
+void EnqueueConnectionUpdate(const wchar_t* deviceId, BluetoothConnectionStatus status)
+{
+    ConnectionUpdate update{};
+    wcsncpy_s(update.deviceId, _countof(update.deviceId), deviceId, _TRUNCATE);
+    update.status = static_cast<int32_t>(status);
+
+    {
+        lock_guard lock(quitLock);
+        if (quitFlag)
+            return;
+    }
+    {
+        lock_guard queueLock(connectionQueueLock);
+        connectionQueue.push(update);
+    }
+    connectionQueueSignal.notify_one();
+}
+
+void BluetoothLEDevice_ConnectionStatusChanged(BluetoothLEDevice const& sender, IInspectable const&)
+{
+    EnqueueConnectionUpdate(sender.DeviceId().c_str(), sender.ConnectionStatus());
+}
+
+void EnsureStatusSubscription(long key, BluetoothLEDevice const& device)
+{
+    auto& entry = cache[key];
+    if (!entry.statusSubscribed)
+    {
+        entry.statusChangedRevoker = device.ConnectionStatusChanged(auto_revoke, &BluetoothLEDevice_ConnectionStatusChanged);
+        entry.statusSubscribed = true;
+        EnqueueConnectionUpdate(device.DeviceId().c_str(), device.ConnectionStatus());
+    }
+}
+
+bool PollConnection(ConnectionUpdate* update, bool block)
+{
+    unique_lock<mutex> lock(connectionQueueLock);
+    while (connectionQueue.empty())
+    {
+        if (!block)
+            return false;
+        if (QuittableWait(connectionQueueSignal, lock))
+            return false;
+    }
+    *update = connectionQueue.front();
+    connectionQueue.pop();
+    return true;
+}
+
 IAsyncOperation<bool> ConnectDeviceAsync(wchar_t* deviceId)
 {
     try
@@ -591,7 +657,6 @@ bool DisconnectDevice(wchar_t* deviceId)
             return false;
         }
 
-        // Remove subscriptions referencing this device
         {
             std::lock_guard subLock(subscribeQueueLock);
             for (auto iter = subscriptions.begin(); iter != subscriptions.end();)
@@ -610,7 +675,13 @@ bool DisconnectDevice(wchar_t* deviceId)
             }
         }
 
-        // Close services and device
+        if (it->second.statusSubscribed)
+        {
+            it->second.statusChangedRevoker.revoke();
+            it->second.statusSubscribed = false;
+        }
+        EnqueueConnectionUpdate(deviceId, BluetoothConnectionStatus::Disconnected);
+
         for (auto& svcPair : it->second.services)
         {
             svcPair.second.service.Close();
@@ -633,9 +704,6 @@ bool DisconnectDevice(wchar_t* deviceId)
     }
     return false;
 }
-
-
-
 
 
 
@@ -776,38 +844,194 @@ void Characteristic_ValueChanged(GattCharacteristic const& characteristic, GattV
 		dataQueueSignal.notify_one();
 	}
 }
-fire_and_forget SubscribeCharacteristicAsync(wchar_t* deviceId, wchar_t* serviceId, wchar_t* characteristicId, bool* result) {
-	try {
-		auto characteristic = co_await retrieveCharacteristic(deviceId, serviceId, characteristicId);
-		if (characteristic != nullptr) {
-			auto status = co_await characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify);
-			if (status != GattCommunicationStatus::Success)
-				saveError(L"%s:%d Error subscribing to characteristic with uuid %s and status %d", __WFILE__, __LINE__, characteristicId, status);
-			else {
-				Subscription *subscription = new Subscription();
-				subscription->characteristic = characteristic;
-				subscription->revoker = characteristic.ValueChanged(auto_revoke, &Characteristic_ValueChanged);
-				subscriptions.push_back(subscription);
-				if (result != 0)
-					*result = true;
-			}
-		}
-	}
-	catch (hresult_error& ex)
-	{
-		saveError(L"%s:%d SubscribeCharacteristicAsync catch: %s", __WFILE__, __LINE__, ex.message().c_str());
-	}
-	subscribeQueueSignal.notify_one();
-}
-bool SubscribeCharacteristic(wchar_t* deviceId, wchar_t* serviceId, wchar_t* characteristicId, bool block) {
-	unique_lock<mutex> lock(subscribeQueueLock);
-	bool result = false;
-	SubscribeCharacteristicAsync(deviceId, serviceId, characteristicId, block ? &result : 0);
-	if (block && QuittableWait(subscribeQueueSignal, lock))
-		return false;
 
-	return result;
+fire_and_forget SubscribeCharacteristicAsync(wchar_t* deviceId,
+                                             wchar_t* serviceId,
+                                             wchar_t* characteristicId,
+                                             bool* completionFlag)
+{
+    bool succeeded = false;
+
+    try
+    {
+        auto characteristic = co_await retrieveCharacteristic(deviceId, serviceId, characteristicId);
+        if (characteristic != nullptr)
+        {
+            auto status = co_await characteristic
+                .WriteClientCharacteristicConfigurationDescriptorAsync(
+                    GattClientCharacteristicConfigurationDescriptorValue::Notify);
+
+            if (status != GattCommunicationStatus::Success)
+            {
+                saveError(L"%s:%d Error subscribing to characteristic %s (status %d)",
+                          __WFILE__, __LINE__, characteristicId, status);
+            }
+            else
+            {
+                auto* subscription = new Subscription();
+                subscription->characteristic = characteristic;
+                subscription->revoker = characteristic.ValueChanged(auto_revoke, &Characteristic_ValueChanged);
+
+                {
+                    std::lock_guard guard(subscribeQueueLock);
+                    subscriptions.push_back(subscription);
+                }
+
+                succeeded = true;
+            }
+        }
+    }
+    catch (hresult_error const& ex)
+    {
+        saveError(L"%s:%d SubscribeCharacteristicAsync catch: %s",
+                  __WFILE__, __LINE__, ex.message().c_str());
+    }
+
+    if (completionFlag)
+        *completionFlag = succeeded;
+
+    subscribeQueueSignal.notify_one();
 }
+
+bool SubscribeCharacteristic(wchar_t* deviceId,
+                             wchar_t* serviceId,
+                             wchar_t* characteristicId,
+                             bool /*block*/)
+{
+    try
+    {
+        auto characteristic = retrieveCharacteristic(deviceId, serviceId, characteristicId).get();
+        if (characteristic == nullptr)
+        {
+            saveError(L"%s:%d Failed to resolve characteristic %s",
+                      __WFILE__, __LINE__, characteristicId);
+            return false;
+        }
+
+        auto status = characteristic
+            .WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::Notify)
+            .get();
+
+        if (status != GattCommunicationStatus::Success)
+        {
+            saveError(L"%s:%d Error subscribing to characteristic %s (status %d)",
+                      __WFILE__, __LINE__, characteristicId, status);
+            return false;
+        }
+
+        auto* subscription = new Subscription();
+        subscription->characteristic = characteristic;
+        subscription->revoker = characteristic.ValueChanged(auto_revoke, &Characteristic_ValueChanged);
+
+        {
+            std::lock_guard guard(subscribeQueueLock);
+            subscriptions.push_back(subscription);
+        }
+
+        clearError();
+        return true;
+    }
+    catch (winrt::hresult_error const& ex)
+    {
+        saveError(L"%s:%d SubscribeCharacteristic catch: %s",
+                  __WFILE__, __LINE__, ex.message().c_str());
+    }
+    catch (...)
+    {
+        saveError(L"%s:%d SubscribeCharacteristic catch: unknown exception.",
+                  __WFILE__, __LINE__);
+    }
+    return false;
+}
+
+bool UnsubscribeCharacteristic(wchar_t* deviceId,
+                               wchar_t* serviceId,
+                               wchar_t* characteristicId)
+{
+    Subscription* target = nullptr;
+    guid serviceGuid = make_guid(serviceId);
+    guid characteristicGuid = make_guid(characteristicId);
+
+    try
+    {
+        {
+            std::lock_guard guard(subscribeQueueLock);
+
+            for (auto it = subscriptions.begin(); it != subscriptions.end(); ++it)
+            {
+                Subscription* sub = *it;
+                if (!sub || !sub->characteristic)
+                    continue;
+
+                auto svc = sub->characteristic.Service();
+                if (!svc)
+                    continue;
+
+                auto dev = svc.Device();
+                if (dev.DeviceId() != deviceId)
+                    continue;
+
+                if (svc.Uuid() != serviceGuid)
+                    continue;
+
+                if (sub->characteristic.Uuid() != characteristicGuid)
+                    continue;
+
+                target = sub;
+                subscriptions.erase(it);
+                break;
+            }
+        }
+
+        if (!target)
+        {
+            saveError(L"%s:%d UnsubscribeCharacteristic: subscription not found.",
+                      __WFILE__, __LINE__);
+            return false;
+        }
+
+        auto status = target->characteristic
+            .WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::None)
+            .get();
+
+        if (status != GattCommunicationStatus::Success)
+        {
+            saveError(L"%s:%d UnsubscribeCharacteristic: CCCD write failed (status %d).",
+                      __WFILE__, __LINE__, static_cast<int>(status));
+
+            std::lock_guard guard(subscribeQueueLock);
+            subscriptions.push_back(target);
+            return false;
+        }
+
+        target->revoker.revoke();
+        delete target;
+
+        clearError();
+        return true;
+    }
+    catch (hresult_error const& ex)
+    {
+        saveError(L"%s:%d UnsubscribeCharacteristic catch: %s",
+                  __WFILE__, __LINE__, ex.message().c_str());
+    }
+    catch (...)
+    {
+        saveError(L"%s:%d UnsubscribeCharacteristic catch: unknown exception.",
+                  __WFILE__, __LINE__);
+    }
+
+    if (target)
+    {
+        std::lock_guard guard(subscribeQueueLock);
+        subscriptions.push_back(target);
+    }
+
+    return false;
+}
+
 
 bool PollData(BLEData* data, bool block) {
 	unique_lock<mutex> lock(dataQueueLock);
@@ -857,46 +1081,60 @@ bool SendData(BLEData* data, bool block) {
 	return result;
 }
 
-void Quit() {
-	{
-		lock_guard lock(quitLock);
-		quitFlag = true;
-	}
-	StopDeviceScan();
-	deviceQueueSignal.notify_one();
-	{
-		lock_guard lock(deviceQueueLock);
-		deviceQueue = {};
-	}
-	serviceQueueSignal.notify_one();
-	{
-		lock_guard lock(serviceQueueLock);
-		serviceQueue = {};
-	}
-	characteristicQueueSignal.notify_one();
-	{
-		lock_guard lock(characteristicQueueLock);
-		characteristicQueue = {};
-	}
-	subscribeQueueSignal.notify_one();
-	{
-		lock_guard lock(subscribeQueueLock);
-		for (auto subscription : subscriptions)
-			subscription->revoker.revoke();
-		subscriptions = {};
-	}
-	dataQueueSignal.notify_one();
-	{
-		lock_guard lock(dataQueueLock);
-		dataQueue = {};
-	}
-	for (auto device : cache) {
-		device.second.device.Close();
-		for (auto service : device.second.services) {
-			service.second.service.Close();
-		}
-	}
-	cache.clear();
+void Quit()
+{
+    {
+        lock_guard lock(quitLock);
+        quitFlag = true;
+    }
+    StopDeviceScan();
+    deviceQueueSignal.notify_one();
+    {
+        lock_guard lock(deviceQueueLock);
+        deviceQueue = {};
+    }
+    serviceQueueSignal.notify_one();
+    {
+        lock_guard lock(serviceQueueLock);
+        serviceQueue = {};
+    }
+    characteristicQueueSignal.notify_one();
+    {
+        lock_guard lock(characteristicQueueLock);
+        characteristicQueue = {};
+    }
+    subscribeQueueSignal.notify_one();
+    {
+        lock_guard lock(subscribeQueueLock);
+        for (auto subscription : subscriptions)
+            subscription->revoker.revoke();
+        subscriptions = {};
+    }
+    dataQueueSignal.notify_one();
+    {
+        lock_guard lock(dataQueueLock);
+        dataQueue = {};
+    }
+    {
+        lock_guard lock(connectionQueueLock);
+        { queue<ConnectionUpdate> empty; std::swap(connectionQueue, empty); }
+    }
+    for (auto& device : cache)
+    {
+        if (device.second.statusSubscribed)
+        {
+            device.second.statusChangedRevoker.revoke();
+            device.second.statusSubscribed = false;
+        }
+        EnqueueConnectionUpdate(device.second.device.DeviceId().c_str(),
+                                BluetoothConnectionStatus::Disconnected);
+        device.second.device.Close();
+        for (auto& service : device.second.services)
+        {
+            service.second.service.Close();
+        }
+    }
+    cache.clear();
 }
 
 void GetError(ErrorMessage* buf) {

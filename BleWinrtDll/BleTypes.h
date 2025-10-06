@@ -40,4 +40,9 @@ struct ErrorMessage {
     wchar_t msg[1024];
 };
 
+struct ConnectionUpdate {
+    wchar_t deviceId[256];
+    int32_t status;   // Windows::Devices::Bluetooth::BluetoothConnectionStatus
+};
+
 enum class ScanStatus { PROCESSING, AVAILABLE, FINISHED };
